@@ -153,9 +153,10 @@ def credential_helper_options():
     return ["store", "cache --timeout=86400"]
 
 
-def S(argv=None, cwd=None, stdin=None, label=None, func=None):
-    """One step of work: either a command (argv) or a Python function (func)."""
-    return {"argv": argv, "cwd": cwd, "stdin": stdin, "label": label, "func": func}
+def S(argv=None, cwd=None, stdin=None, label=None, func=None, project=None):
+    """One step of work: either a command (argv) or a Python function (func).
+    `project` overrides the project the whole run belongs to (used by Check all status)."""
+    return {"argv": argv, "cwd": cwd, "stdin": stdin, "label": label, "func": func, "project": project}
 
 
 def F(key, label, default="", kind="entry", **kw):
@@ -189,12 +190,16 @@ def b_init(app, p):
     return [S(["git", "init", "-b", "main"])]
 
 
+def forced(app, title):
+    return f"{title}  (FORCE)" if app.forcing else title
+
+
 def b_add(app, p):
-    r = app.ask("git add", [F("paths", "Files to add", ".",
+    r = app.ask(forced(app, "git add"), [F("paths", "Files to add", ".",
                               hint="Space-separated paths. '.' adds everything in the folder.")])
     if not r:
         return None
-    return [S(["git", "add", "--", *(split_args(r["paths"]) or ["."])])]
+    return [S(["git", "add", *(["-f"] if app.forcing else []), "--", *(split_args(r["paths"]) or ["."])])]
 
 
 def b_commit(app, p):
@@ -220,10 +225,14 @@ def b_commit(app, p):
 
 
 def b_push(app, p):
+    if app.forcing:
+        return [S(["git", "push", "--force-with-lease", "-u", "origin", "HEAD"])]
     return [S(["git", "push", "-u", "origin", "HEAD"])]
 
 
 def b_pull(app, p):
+    if app.forcing:
+        return [S(["git", "fetch", "origin"]), S(["git", "reset", "--hard", "@{u}"])]
     code, _ = git_out(["config", "pull.rebase"], p["path"])
     return [S(["git", "pull"] if code == 0 else ["git", "pull", "--no-rebase"])]
 
@@ -233,7 +242,7 @@ def b_fetch(app, p):
 
 
 def b_branch(app, p):
-    r = app.ask("git branch", [
+    r = app.ask(forced(app, "git branch"), [
         F("name", "New branch name", hint="Leave blank to just list all branches."),
         F("switch", "Switch to the new branch", True, "check"),
     ])
@@ -241,15 +250,17 @@ def b_branch(app, p):
         return None
     if not r["name"]:
         return [S(["git", "branch", "-a", "-vv"])]
+    if app.forcing:
+        return [S(["git", "switch", "-C", r["name"]] if r["switch"] else ["git", "branch", "-f", r["name"]])]
     return [S(["git", "switch", "-c", r["name"]] if r["switch"] else ["git", "branch", r["name"]])]
 
 
 def b_switch(app, p):
     branches = local_branches(p["path"])
-    r = app.ask("git switch", [F("name", "Branch", current_branch(p["path"]), "combo", values=branches)])
+    r = app.ask(forced(app, "git switch"), [F("name", "Branch", current_branch(p["path"]), "combo", values=branches)])
     if not r or not r["name"]:
         return None
-    return [S(["git", "switch", r["name"]])]
+    return [S(["git", "switch", *(["--discard-changes"] if app.forcing else []), r["name"]])]
 
 
 def b_merge(app, p):
@@ -300,7 +311,7 @@ def b_clone(app, p):
 
 
 def b_tag(app, p):
-    r = app.ask("git tag", [
+    r = app.ask(forced(app, "git tag"), [
         F("name", "Tag name", hint="e.g. v1.2.0 — leave blank to list existing tags."),
         F("message", "Message", hint="Optional annotation (defaults to the tag name)."),
         F("push", "Push the tag to GitHub", True, "check"),
@@ -309,9 +320,10 @@ def b_tag(app, p):
         return None
     if not r["name"]:
         return [S(["git", "tag", "-n", "--sort=-creatordate"])]
-    steps = [S(["git", "tag", "-a", r["name"], "-m", r["message"] or r["name"]])]
+    f = ["-f"] if app.forcing else []
+    steps = [S(["git", "tag", "-a", *f, r["name"], "-m", r["message"] or r["name"]])]
     if r["push"]:
-        steps.append(S(["git", "push", "origin", f"refs/tags/{r['name']}"]))
+        steps.append(S(["git", "push", *(["--force"] if app.forcing else []), "origin", f"refs/tags/{r['name']}"]))
     return steps
 
 
@@ -394,17 +406,63 @@ def b_open_web(app, p):
     return None
 
 
+def status_summary(projects):
+    """One line per project: uncommitted changes and how far ahead/behind GitHub it is."""
+    lines = []
+    for p in projects:
+        path = p["path"]
+        _, changes = git_out(["status", "--porcelain"], path)
+        parts = []
+        n = len(changes.splitlines()) if changes else 0
+        if n:
+            parts.append(f"{n} uncommitted change{'s' if n != 1 else ''}")
+        code, ab = git_out(["rev-list", "--left-right", "--count", "HEAD...@{u}"], path)
+        if code == 0 and len(ab.split()) == 2:
+            ahead, behind = (int(x) for x in ab.split())
+            if ahead:
+                parts.append(f"{ahead} commit{'s' if ahead != 1 else ''} to push")
+            if behind:
+                parts.append(f"{behind} commit{'s' if behind != 1 else ''} to pull")
+        else:
+            parts.append("no upstream branch")
+        lines.append(f"{'✔' if not parts else '•'} {p['name']}: {', '.join(parts) or 'clean and in sync'}")
+    return "\n".join(lines)
+
+
+# force = (short hover text, warning shown in the confirmation popup)
 COMMANDS = {
     "status":   dict(label="Status",            desc="git status — show what changed", build=b_status),
-    "add":      dict(label="Add",               desc="git add — stage files for the next commit", build=b_add),
+    "add":      dict(label="Add",               desc="git add — stage files for the next commit", build=b_add,
+                     force=("git add -f — also add files your .gitignore excludes",
+                            "Force-add stages files even when .gitignore excludes them — build output, "
+                            "large files, or secrets such as .env files. Make sure you really want "
+                            "them in the repository.")),
     "commit":   dict(label="Commit",            desc="git commit — save staged changes", build=b_commit),
-    "push":     dict(label="Push",              desc="git push — upload commits to GitHub", build=b_push),
-    "pull":     dict(label="Pull",              desc="git pull — download and merge changes", build=b_pull),
+    "push":     dict(label="Push",              desc="git push — upload commits to GitHub", build=b_push,
+                     force=("git push --force-with-lease — overwrite the branch on GitHub",
+                            "Force-push replaces the branch on GitHub with your local version. Commits on "
+                            "GitHub that you don't have locally will be removed.\n\n"
+                            "(--force-with-lease still refuses if someone else pushed since your last fetch.)")),
+    "pull":     dict(label="Pull",              desc="git pull — download and merge changes", build=b_pull,
+                     force=("Discard local work and match GitHub exactly (fetch + reset --hard)",
+                            "Force-pull fetches from GitHub and runs git reset --hard to match it.\n\n"
+                            "ALL uncommitted changes to tracked files and ANY local commits that are not "
+                            "on GitHub will be permanently lost.")),
     "fetch":    dict(label="Fetch",             desc="git fetch --all --prune", build=b_fetch),
-    "branch":   dict(label="Branch",            desc="git branch — create or list branches", build=b_branch),
-    "switch":   dict(label="Switch branch",     desc="git switch — change the current branch", build=b_switch),
+    "branch":   dict(label="Branch",            desc="git branch — create or list branches", build=b_branch,
+                     force=("git switch -C / branch -f — recreate a branch that already exists",
+                            "If a branch with this name already exists, it is reset to the current commit. "
+                            "Commits that were only on the old branch may be lost.")),
+    "switch":   dict(label="Switch branch",     desc="git switch — change the current branch", build=b_switch,
+                     force=("git switch --discard-changes — switch and throw away local edits",
+                            "Switching with force throws away ALL uncommitted changes to tracked files "
+                            "in this project.")),
     "merge":    dict(label="Merge",             desc="git merge — merge another branch in", build=b_merge),
-    "tag":      dict(label="Tag",               desc="git tag — create (and push) a version tag", build=b_tag),
+    "tag":      dict(label="Tag",               desc="git tag — create (and push) a version tag", build=b_tag,
+                     force=("git tag -f — move an existing tag (and force-push it)",
+                            "Force-tagging moves an existing tag to the current commit and force-pushes it "
+                            "to GitHub. Anything that uses the old tag, such as a release, will now point "
+                            "to a different commit.")),
     "release":  dict(label="Release",           desc="Create a GitHub release from a tag", build=b_release),
     "log":      dict(label="History",           desc="git log — recent commits", build=b_log),
     "diff":     dict(label="Diff",              desc="git diff — unstaged changes", build=b_diff),
@@ -731,6 +789,9 @@ class App(tk.Tk):
         self.log_lock = threading.Lock()
         self.busy = False
         self.current = None
+        self.forcing = False   # True only while a forced command's steps are being built
+        self.force_var = tk.BooleanVar(value=False)
+        self.check_on_launch_var = tk.BooleanVar(value=bool(self.config_data.get("check_on_launch")))
 
         self._setup_style()
         self._build_menu()
@@ -748,6 +809,8 @@ class App(tk.Tk):
         self.after(80, self._poll)
         if not shutil.which("git"):
             messagebox.showerror(APP_NAME, "Git was not found on your PATH.\nInstall it from https://git-scm.com and restart.")
+        elif self.check_on_launch_var.get():
+            self.after(400, self.check_all_status)
 
     # ---------- config
     def load_config(self):
@@ -796,6 +859,10 @@ class App(tk.Tk):
         gm.add_command(label="GitHub login…", command=self.login_dialog)
         gm.add_command(label="Test GitHub login", command=self.test_login)
         gm.add_separator()
+        gm.add_command(label="Check all status", command=self.check_all_status)
+        gm.add_checkbutton(label="Check all status at launch", variable=self.check_on_launch_var,
+                           command=self._toggle_launch_check)
+        gm.add_separator()
         gm.add_command(label="Command log…", command=lambda: LogViewer(self))
         m.add_cascade(label="Git", menu=gm)
         pm = tk.Menu(m, tearoff=False)
@@ -843,7 +910,15 @@ class App(tk.Tk):
         self.info_var = tk.StringVar()
         ttk.Label(right, textvariable=self.info_var, foreground="gray", justify="left").pack(anchor="w", pady=(4, 8))
 
-        self.cmd_frame = ttk.LabelFrame(right, text="Commands", padding=8)
+        ch = ttk.Frame(right)
+        ch.pack(fill="x", pady=(0, 4))
+        ttk.Label(ch, text="Commands", style="Heading.TLabel").pack(side="left")
+        fc = ttk.Checkbutton(ch, text="⚠ Force", variable=self.force_var, command=self.render_buttons)
+        fc.pack(side="right")
+        fc.bind("<Enter>", lambda e: self.status_var.set(
+            "Force mode: the next forceable command runs with force after a warning. Turns off after one use."))
+        fc.bind("<Leave>", lambda e: self.status_var.set("Running…" if self.busy else "Ready."))
+        self.cmd_frame = ttk.LabelFrame(right, padding=8)
         self.cmd_frame.pack(fill="x")
 
         oh = ttk.Frame(right)
@@ -860,6 +935,7 @@ class App(tk.Tk):
         self.console.pack(side="left", fill="both", expand=True)
         csb.pack(side="right", fill="y")
         self.console.tag_configure("cmd", foreground="#6cb6ff")
+        self.console.tag_configure("proj", foreground="#e5c07b")
         self.console.tag_configure("ok", foreground="#7ec699")
         self.console.tag_configure("err", foreground="#ff7b72")
 
@@ -948,13 +1024,19 @@ class App(tk.Tk):
             ttk.Label(self.cmd_frame, text="All buttons are hidden — open ⚙ Settings to show some.").grid(row=0, column=0, sticky="w")
             return
         cols = 4
+        forcing = self.force_var.get()
         for c in range(cols):
             self.cmd_frame.columnconfigure(c, weight=1, uniform="cmd")
         for i, key in enumerate(visible):
-            b = ttk.Button(self.cmd_frame, text=COMMANDS[key]["label"], style="Cmd.TButton",
-                           command=lambda k=key: self.run_command(k))
+            cmd = COMMANDS[key]
+            can_force = "force" in cmd
+            b = ttk.Button(self.cmd_frame, text=("⚠ " if forcing and can_force else "") + cmd["label"],
+                           style="Cmd.TButton", command=lambda k=key: self.run_command(k))
+            if forcing and not can_force:
+                b.state(["disabled"])
             b.grid(row=i // cols, column=i % cols, sticky="ew", padx=3, pady=3)
-            b.bind("<Enter>", lambda e, k=key: self.status_var.set(COMMANDS[k]["desc"]))
+            desc = cmd["force"][0] if forcing and can_force else cmd["desc"]
+            b.bind("<Enter>", lambda e, d=desc: self.status_var.set(d))
             b.bind("<Leave>", lambda e: self.status_var.set("Running…" if self.busy else "Ready."))
 
     # ---------- running commands
@@ -979,9 +1061,23 @@ class App(tk.Tk):
                 if messagebox.askyesno(APP_NAME, f"'{p['name']}' is not a git repository yet.\nRun git init now?"):
                     self.run_steps(p, b_init(self, p), lambda ok: self.refresh_header())
                 return
-        result = cmd["build"](self, p)
+        force = bool(self.force_var.get() and cmd.get("force"))
+        if force:
+            where = f"\n\nProject: {p['name']}" if p else ""
+            if not messagebox.askyesno(f"Force {cmd['label']}?",
+                                       f"{cmd['force'][1]}{where}\n\nThis cannot be undone. Continue?",
+                                       icon="warning", default="no"):
+                return
+        self.forcing = force
+        try:
+            result = cmd["build"](self, p)
+        finally:
+            self.forcing = False
         if not result:
             return
+        if force:  # force mode is one-shot, so the next click is never forced by accident
+            self.force_var.set(False)
+            self.render_buttons()
         steps, on_done = result if isinstance(result, tuple) else (result, None)
 
         def finished(ok):
@@ -990,21 +1086,23 @@ class App(tk.Tk):
                 on_done(ok)
         self.run_steps(p, steps, finished)
 
-    def run_steps(self, project, steps, on_done=None):
+    def run_steps(self, project, steps, on_done=None, stop_on_error=True):
         if self.busy:
             messagebox.showinfo(APP_NAME, "Please wait for the current command to finish.")
             return
         self.busy = True
         self.status_var.set("Running…")
-        threading.Thread(target=self._worker, args=(project, steps, on_done), daemon=True).start()
+        threading.Thread(target=self._worker, args=(project, steps, on_done, stop_on_error), daemon=True).start()
 
-    def _worker(self, project, steps, on_done):
+    def _worker(self, project, steps, on_done, stop_on_error=True):
         ok = True
-        pname = project["name"] if project else "(global)"
         for step in steps:
-            cwd = step["cwd"] or (project["path"] if project else str(Path.home()))
+            proj = step.get("project") or project
+            pname = proj["name"] if proj else "(global)"
+            cwd = step["cwd"] or (proj["path"] if proj else str(Path.home()))
             label = step["label"] or quote_cmd(step["argv"])
-            self.q.put(("text", (f"\n$ {label}\n", "cmd")))
+            self.q.put(("text", (f"\n{pname} ", "proj")))
+            self.q.put(("text", (f"$ {label}\n", "cmd")))
             t0 = time.time()
             if step["func"]:
                 try:
@@ -1023,7 +1121,8 @@ class App(tk.Tk):
             self.write_log(pname, cwd, label, code, dur, out)
             if code != 0:
                 ok = False
-                break
+                if stop_on_error:
+                    break
         self.q.put(("done", (ok, on_done)))
 
     def _stream(self, argv, cwd, stdin):
@@ -1076,7 +1175,7 @@ class App(tk.Tk):
                 elif kind == "done":
                     ok, cb = payload
                     self.busy = False
-                    self.status_var.set("Done." if ok else "Command failed — see output.")
+                    self.status_var.set("Done." if ok else "Finished with errors — see output.")
                     if cb:
                         try:
                             cb(ok)
@@ -1238,6 +1337,28 @@ class App(tk.Tk):
     def _verify_login():
         data = github_api("GET", "/user", get_github_token())
         return f"✔ GitHub accepted your token — logged in as {data.get('login')}"
+
+    def check_all_status(self):
+        """Fetch + status for every project, then a one-line summary per project."""
+        if self.busy:
+            messagebox.showinfo(APP_NAME, "Please wait for the current command to finish.")
+            return
+        repos = [p for p in self.config_data["projects"]
+                 if Path(p["path"]).is_dir() and git_out(["rev-parse", "--git-dir"], p["path"])[0] == 0]
+        if not repos:
+            self.console_write("\nCheck all status: no projects with a git repository yet.\n", "err")
+            return
+        steps = []
+        for p in repos:
+            if origin_url(p["path"]):
+                steps.append(S(["git", "fetch", "--quiet"], project=p))
+            steps.append(S(["git", "status", "-sb"], project=p))
+        steps.append(S(func=lambda: status_summary(repos), label="summary of all projects"))
+        self.run_steps(None, steps, lambda ok: self.refresh_header(), stop_on_error=False)
+
+    def _toggle_launch_check(self):
+        self.config_data["check_on_launch"] = bool(self.check_on_launch_var.get())
+        self.save_config()
 
     def test_login(self):
         self.run_steps(None, [S(func=self._verify_login, label="GitHub API: check login")])

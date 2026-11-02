@@ -27,17 +27,15 @@ The token is stored in Git's credential helper. On Windows that's Credential Man
 | New project + GitHub repo | **New project…** creates the folder, README, .gitignore, first commit, the GitHub repo (via the GitHub API), and pushes |
 | Clone | **Clone from URL…** (the clone is added to the list automatically) |
 | Command buttons | Status, Add, Commit, Push, Pull, Fetch, Branch, Switch, Merge, Tag, Release, History, Diff, Stash, Remote add origin, Init, Clone, Open on GitHub, **Custom command…** (any git/gh command) |
+| Check all status | **Git ▸ Check all status** runs fetch + status on every project and ends with a one-line summary each (uncommitted changes, commits to push/pull). Tick **Git ▸ Check all status at launch** to run it every time the app opens |
+| Force mode | Tick **⚠ Force** above the buttons. Forceable commands (Add, Push, Pull, Branch, Switch branch, Tag) get a ⚠ and everything else is greyed out. Clicking one shows a warning popup first, and Force switches itself off after one use |
 | Per-project settings | **⚙ Settings** to show/hide buttons, reorder them, rename or remove the project |
 | Command log | **⚙ Settings ▸ View command log** (this project), or **Git ▸ Command log…** (all projects) |
 
-Commands run in the background, and their output streams into the Output pane. A multi-step action stops at the first failing step.
+Commands run in the background, and their output streams into the Output pane, with the project name in front of each command (`website $ git push`). A multi-step action stops at the first failing step.
 
 ## Notes
 
-<<<<<<< HEAD
-- **Release** creates a GitHub release through the GitHub API, and pushes the tag first if it exists locally.
-=======
 - `git release` isn't a real git command. **Release** creates a GitHub release through the GitHub API, and pushes the tag first if it exists locally.
->>>>>>> 3105da9b9a0b52ae6ff61b35d556a316a4aa6b81
 - Commands that need an editor or typed input (e.g. `git rebase -i`) aren't supported, because nothing can wait on a prompt in the background.
 - Settings and the log are stored in `~/.git_project_manager/`. Your token is never written to the log.
