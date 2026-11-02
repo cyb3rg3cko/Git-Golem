@@ -1,0 +1,70 @@
+name: Build
+
+# Runs when you push a version tag (e.g. v1.2.0 — the app's Tag button does this),
+# or manually from the Actions tab. Tag builds are attached to the GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create/upload to releases
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04   # older glibc = the binary runs on more distros
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0    # tags, for the version number
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build binary and .deb
+        run: bash packaging/build_linux.sh
+        env:
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux
+          path: dist/*
+
+      - name: Attach to release
+        if: github.ref_type == 'tag'
+        run: bash packaging/publish_release.sh dist/*
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Build .exe and installer
+        shell: pwsh
+        run: ./packaging/build_windows.ps1
+        env:
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          path: dist/*
+
+      - name: Attach to release
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: bash packaging/publish_release.sh dist/*
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

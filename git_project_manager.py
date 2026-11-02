@@ -136,6 +136,12 @@ def github_api(method, path, token, payload=None):
         raise RuntimeError(f"Could not reach GitHub: {e.reason}")
 
 
+def resource_path(name):
+    """Path to a file shipped with the app — works from source and from a PyInstaller binary."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
 def open_path(path):
     if os.name == "nt":
         os.startfile(path)  # noqa
@@ -780,7 +786,8 @@ class LogViewer(tk.Toplevel):
 
 class App(tk.Tk):
     def __init__(self):
-        super().__init__()
+        # className sets the Linux WM_CLASS ("Git-project-manager") so the .desktop entry matches the window
+        super().__init__(className="git-project-manager")
         self.title(APP_NAME)
         self.geometry("1120x720")
         self.minsize(860, 540)
@@ -794,6 +801,7 @@ class App(tk.Tk):
         self.check_on_launch_var = tk.BooleanVar(value=bool(self.config_data.get("check_on_launch")))
 
         self._setup_style()
+        self._set_icon()
         self._build_menu()
         self._build_ui()
         self.refresh_project_list()
@@ -845,6 +853,16 @@ class App(tk.Tk):
         style.configure("Title.TLabel", font=self.title_font)
         style.configure("Heading.TLabel", font=self.head_font)
         style.configure("Cmd.TButton", padding=(8, 6))
+
+    def _set_icon(self):
+        """Use icon.png as the window/taskbar icon (next to the script, or bundled in a built binary)."""
+        path = resource_path("icon.png")
+        if os.path.isfile(path):
+            try:
+                self._icon = tk.PhotoImage(file=path)
+                self.iconphoto(True, self._icon)
+            except tk.TclError:
+                pass
 
     def _build_menu(self):
         m = tk.Menu(self)

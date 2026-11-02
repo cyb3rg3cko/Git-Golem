@@ -36,6 +36,27 @@ The token is stored in Git's credential helper. On Windows that's Credential Man
 
 Commands run in the background, and their output streams into the Output pane, with the project name in front of each command (`website $ git push`). A multi-step action stops at the first failing step.
 
+## Building binaries and installers
+
+`icon.png` in the project folder is used for the app window, the .exe, the Windows installer and the Linux menu entry.
+
+**Automatically (GitHub Actions):** push a version tag such as `v1.2.0` (the app's **Tag** button with *Push the tag* ticked does this). `.github/workflows/build.yml` then builds everything and attaches it to the GitHub release for that tag:
+
+| File | What it is |
+|---|---|
+| `GitProjectManager-<version>-windows-setup.exe` | Windows installer (Start menu shortcut, optional desktop icon, uninstaller; no admin rights needed) |
+| `GitProjectManager-<version>-windows-portable.exe` | Windows single-file app, no install |
+| `git-project-manager_<version>_amd64.deb` | Debian/Ubuntu package (`sudo apt install ./git-project-manager_*.deb`) |
+| `git-project-manager-<version>-linux-amd64` | Linux single-file app |
+
+You can also run the workflow by hand from the **Actions** tab. Its files then appear as downloads on the run page instead of in a release.
+
+**Locally:**
+- **Linux:** `bash packaging/build_linux.sh` (needs Python with Tkinter and `python3-venv`).
+- **Windows:** `powershell -ExecutionPolicy Bypass -File packaging\build_windows.ps1` (needs Python from python.org and Inno Setup 6: `winget install JRSoftware.InnoSetup`).
+
+Output goes to `dist/`. The `build/` and `dist/` folders are generated, so add them to your `.gitignore`.
+
 ## Notes
 
 - **Release** creates a GitHub release through the GitHub API, and pushes the tag first if it exists locally.
