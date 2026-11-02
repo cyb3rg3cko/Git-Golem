@@ -4,9 +4,11 @@ A desktop app (Python + Tkinter, no extra packages) for maintaining your GitHub 
 
 ## Run it
 
-```
-python git_project_manager.py
-```
+Keep all files in one folder, then:
+
+- **Windows:** double-click `start.vbs` (opens the app with no console window).
+- **Linux / macOS:** run `./start.sh`. The first time, make it executable with `chmod +x start.sh`.
+- **Anywhere:** `python git_project_manager.py`.
 
 Requirements: Python 3.8+ with Tkinter, and Git.
 - **Windows / macOS (python.org installer):** Tkinter is included.
@@ -36,6 +38,6 @@ Commands run in the background, and their output streams into the Output pane, w
 
 ## Notes
 
-- `git release` isn't a real git command. **Release** creates a GitHub release through the GitHub API, and pushes the tag first if it exists locally.
+- **Release** creates a GitHub release through the GitHub API, and pushes the tag first if it exists locally.
 - Commands that need an editor or typed input (e.g. `git rebase -i`) aren't supported, because nothing can wait on a prompt in the background.
 - Settings and the log are stored in `~/.git_project_manager/`. Your token is never written to the log.
