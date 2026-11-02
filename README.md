@@ -34,6 +34,10 @@ Commands run in the background, and their output streams into the Output pane. A
 
 ## Notes
 
+<<<<<<< HEAD
 - **Release** creates a GitHub release through the GitHub API, and pushes the tag first if it exists locally.
+=======
+- `git release` isn't a real git command. **Release** creates a GitHub release through the GitHub API, and pushes the tag first if it exists locally.
+>>>>>>> 3105da9b9a0b52ae6ff61b35d556a316a4aa6b81
 - Commands that need an editor or typed input (e.g. `git rebase -i`) aren't supported, because nothing can wait on a prompt in the background.
 - Settings and the log are stored in `~/.git_project_manager/`. Your token is never written to the log.
