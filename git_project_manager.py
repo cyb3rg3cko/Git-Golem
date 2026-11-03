@@ -137,6 +137,81 @@ def github_api(method, path, token, payload=None, timeout=30):
         raise RuntimeError(f"Could not reach GitHub: {e.reason}")
 
 
+ACTIVE_RUN_STATES = {"queued", "in_progress", "waiting", "requested", "pending"}
+
+
+def try_github_token():
+    try:
+        return get_github_token()
+    except RuntimeError:
+        return None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def github_download(url, token, dest, accept="application/octet-stream", progress=None):
+    """Download a release file or build artifact to dest.
+    GitHub replies with a redirect to its file storage; that link is followed WITHOUT the token."""
+    headers = {"User-Agent": "git-project-manager", "Accept": accept}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        try:
+            resp = urllib.request.build_opener(_NoRedirect).open(urllib.request.Request(url, headers=headers), timeout=30)
+        except urllib.error.HTTPError as e:
+            if e.code not in (301, 302, 303, 307, 308) or not e.headers.get("Location"):
+                raise
+            resp = urllib.request.urlopen(urllib.request.Request(
+                e.headers["Location"], headers={"User-Agent": "git-project-manager"}), timeout=60)
+    except urllib.error.HTTPError as e:
+        hint = " — log in with 🔑 GitHub login" if e.code in (401, 403, 404) and not token else ""
+        raise RuntimeError(f"HTTP {e.code} {e.reason}{hint}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Could not reach GitHub: {e.reason}")
+    total = int(resp.headers.get("Content-Length") or 0)
+    tmp, done = dest + ".part", 0
+    try:
+        with resp, open(tmp, "wb") as f:
+            while True:
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                if progress:
+                    progress(done, total)
+        os.replace(tmp, dest)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def human_size(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def time_ago(iso):
+    try:
+        t = datetime.datetime.fromisoformat((iso or "").replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    s = (datetime.datetime.now(datetime.timezone.utc) - t).total_seconds()
+    if s < 90:
+        return "just now"
+    if s < 3600:
+        return f"{int(s // 60)} min ago"
+    if s < 86400:
+        return f"{int(s // 3600)} h ago"
+    return t.astimezone().strftime("%Y-%m-%d")
+
+
 def resource_path(name):
     """Path to a file shipped with the app — works from source and from a PyInstaller binary."""
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
@@ -911,6 +986,245 @@ class LogViewer(tk.Toplevel):
             self.load()
 
 
+class Toast(tk.Toplevel):
+    """A small notification in the bottom-right corner of the screen that closes by itself."""
+    stack = []
+    COLORS = {"info": "#2f81f7", "ok": "#2da44e", "err": "#cf222e", "busy": "#bf8700"}
+
+    def __init__(self, app, title, text, kind="info", action=None, timeout=12000):
+        super().__init__(app)
+        self.overrideredirect(True)
+        try:
+            self.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        bg = "#ffffff"
+        outer = tk.Frame(self, bg="#d0d7de", padx=1, pady=1)
+        outer.pack(fill="both", expand=True)
+        tk.Frame(outer, bg=self.COLORS.get(kind, self.COLORS["info"]), width=6).pack(side="left", fill="y")
+        body = tk.Frame(outer, bg=bg, padx=12, pady=10)
+        body.pack(side="left", fill="both", expand=True)
+        tk.Label(body, text=title, bg=bg, fg="#1f2328", font=app.head_font, anchor="w",
+                 justify="left", wraplength=340).pack(fill="x")
+        tk.Label(body, text=text, bg=bg, fg="#57606a", anchor="w", justify="left",
+                 wraplength=340).pack(fill="x", pady=(2, 0))
+        btns = tk.Frame(body, bg=bg)
+        btns.pack(fill="x", pady=(8, 0))
+        if action:
+            ttk.Button(btns, text=action[0], command=lambda: (action[1](), self.close())).pack(side="left")
+        ttk.Button(btns, text="Dismiss", command=self.close).pack(side="right")
+        Toast.stack.append(self)
+        while len(Toast.stack) > 4:
+            Toast.stack[0].close()
+        Toast._restack()
+        self.after(timeout, self.close)
+        try:
+            app.bell()
+        except tk.TclError:
+            pass
+
+    @classmethod
+    def _restack(cls):
+        bottom = None
+        for t in reversed(cls.stack):  # newest at the bottom
+            t.update_idletasks()
+            w, h = max(t.winfo_reqwidth(), 300), t.winfo_reqheight()
+            if bottom is None:
+                bottom = t.winfo_screenheight() - 64
+            bottom -= h
+            t.geometry(f"{w}x{h}+{t.winfo_screenwidth() - w - 24}+{bottom}")
+            bottom -= 10
+
+    def close(self):
+        if self in Toast.stack:
+            Toast.stack.remove(self)
+            self.destroy()
+            Toast._restack()
+
+
+class DownloadsPanel(ttk.Frame):
+    """The Downloads tab: release files and Actions build artifacts for the current project."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent, padding=(0, 8, 0, 0))
+        self.app = app
+        self.items = {}         # tree row -> ("release" | "asset" | "artifact", GitHub data)
+        self.loaded_for = None  # project path the tree is showing
+        self.gh = None
+
+        self.banner = tk.Frame(self, bg="#fff8c5", padx=10, pady=6, highlightthickness=1,
+                               highlightbackground="#d4a72c")
+        self.banner_text = tk.Label(self.banner, bg="#fff8c5", fg="#3b2300", justify="left", anchor="w")
+        self.banner_text.pack(side="left", fill="x", expand=True)
+        self.banner_btn = ttk.Button(self.banner, text="View on GitHub")
+        self.banner_btn.pack(side="right", padx=(8, 0))
+
+        self.bar = ttk.Frame(self)
+        self.bar.pack(fill="x", pady=(0, 6))
+        ttk.Button(self.bar, text="⬇ Download", command=self.download_selected).pack(side="left")
+        ttk.Button(self.bar, text="↻ Refresh", command=self.load).pack(side="left", padx=6)
+        ttk.Button(self.bar, text="Actions page", command=lambda: self._open_web("actions")).pack(side="right")
+        ttk.Button(self.bar, text="Releases page", command=lambda: self._open_web("releases")).pack(side="right", padx=6)
+
+        tf = ttk.Frame(self)
+        tf.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(tf, columns=("info", "date"), show="tree headings", selectmode="browse")
+        for col, text, w, st in [("#0", "Release / file", 380, True), ("info", "Size / status", 160, False),
+                                 ("date", "Date", 100, False)]:
+            self.tree.heading(col, text=text, anchor="w")
+            self.tree.column(col, width=w, stretch=st, anchor="w")
+        sb = ttk.Scrollbar(tf, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self.tree.bind("<Double-1>", lambda e: self.download_selected(quiet=True))
+        self.msg = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.msg, foreground="gray").pack(anchor="w", pady=(4, 0))
+
+    def _open_web(self, page):
+        if self.gh:
+            webbrowser.open(f"https://github.com/{self.gh[0]}/{self.gh[1]}/{page}")
+
+    def load(self):
+        p = self.app.current
+        self.tree.delete(*self.tree.get_children())
+        self.items.clear()
+        self.loaded_for = p["path"] if p else None
+        self.gh = parse_github(origin_url(p["path"])) if p and Path(p["path"]).is_dir() else None
+        if not p:
+            self.msg.set("Select a project.")
+            return
+        if not self.gh:
+            self.msg.set("This project has no GitHub remote named 'origin'.")
+            return
+        self.msg.set("Loading from GitHub…")
+        project, (owner, repo) = dict(p), self.gh
+
+        def work():
+            token = try_github_token()
+            try:
+                base = f"/repos/{owner}/{repo}"
+                rels = github_api("GET", f"{base}/releases?per_page=15", token, timeout=15)
+                runs = github_api("GET", f"{base}/actions/runs?per_page=30", token, timeout=15).get("workflow_runs", [])
+                arts = github_api("GET", f"{base}/actions/artifacts?per_page=30", token, timeout=15).get("artifacts", [])
+                res = (rels, runs, arts, None)
+            except RuntimeError as e:
+                res = ([], [], [], str(e) + ("" if token else " — log in with 🔑 GitHub login for private repos"))
+            self.app.q.put(("call", lambda: self._render(project, *res)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render(self, project, rels, runs, arts, err):
+        if project["path"] != self.loaded_for:
+            return  # the user switched project while this was loading
+        if err:
+            self.msg.set(err)
+            return
+        runs_by_id = {r["id"]: r for r in runs}
+        for i, rel in enumerate(rels):
+            kind = "draft" if rel.get("draft") else "pre-release" if rel.get("prerelease") else "release"
+            title = rel.get("name") or rel["tag_name"]
+            assets = rel.get("assets", [])
+            pid = self.tree.insert("", "end", open=(i == 0),
+                                   text=rel["tag_name"] + (f" — {title}" if title != rel["tag_name"] else ""),
+                                   values=(f"{kind} · {len(assets)} file{'s' if len(assets) != 1 else ''}",
+                                           (rel.get("published_at") or rel.get("created_at") or "")[:10]))
+            self.items[pid] = ("release", rel)
+            for a in assets:
+                iid = self.tree.insert(pid, "end", text="📦 " + a["name"],
+                                       values=(human_size(a.get("size")), (a.get("updated_at") or "")[:10]))
+                self.items[iid] = ("asset", a)
+            if not assets:
+                self.tree.insert(pid, "end", text="(no files yet)", values=("", ""))
+        live = [a for a in arts if not a.get("expired")]
+        if live:
+            pid = self.tree.insert("", "end", text="Build artifacts from Actions (manual runs)", open=not rels,
+                                   values=(f"{len(live)} file{'s' if len(live) != 1 else ''}", ""))
+            for a in live:
+                wr = a.get("workflow_run") or {}
+                run = runs_by_id.get(wr.get("id"))
+                where = f"run #{run['run_number']} · {run.get('head_branch', '')}" if run else wr.get("head_branch", "")
+                iid = self.tree.insert(pid, "end", text=f"🗜 {a['name']}.zip   ({where})",
+                                       values=(human_size(a.get("size_in_bytes")), (a.get("created_at") or "")[:10]))
+                self.items[iid] = ("artifact", a)
+        self.msg.set(f"{len(rels)} release(s), {len(live)} build artifact(s). Double-click a file to download it."
+                     if rels or live else "No releases or build artifacts yet.")
+        self.app.apply_runs(project, runs)  # keeps the 'building' banner in sync with what's shown
+
+    def set_builds(self, runs):
+        if not runs:
+            self.banner.pack_forget()
+            return
+        n = len(runs)
+        lines = [f"⏳ {n} build{'s' if n != 1 else ''} running — the files will show up here when finished."]
+        for r in runs[:4]:
+            started = time_ago(r.get("run_started_at") or r.get("created_at"))
+            lines.append(f"     • {r.get('name') or 'Workflow'} · {r.get('display_title') or r.get('head_branch', '')}"
+                         f" · {r.get('status', '').replace('_', ' ')}" + (f" · started {started}" if started else ""))
+        self.banner_text.config(text="\n".join(lines))
+        url = runs[0].get("html_url")
+        self.banner_btn.config(command=lambda: url and webbrowser.open(url))
+        self.banner.pack(fill="x", pady=(0, 8), before=self.bar)
+
+    def download_selected(self, quiet=False):
+        sel = self.tree.selection()
+        kind, data = self.items.get(sel[0], (None, None)) if sel else (None, None)
+        if kind not in ("asset", "artifact"):
+            if not quiet:
+                messagebox.showinfo(APP_NAME, "Select a file inside a release (or a build artifact) to download.",
+                                    parent=self.app)
+            return
+        iid, token = sel[0], try_github_token()
+        if kind == "artifact" and not token:
+            messagebox.showerror(APP_NAME, "Downloading build artifacts needs your GitHub login.\n"
+                                 "Use 🔑 GitHub login… first.", parent=self.app)
+            return
+        start = self.app.config_data.get("download_dir") or str(Path.home() / "Downloads")
+        folder = filedialog.askdirectory(parent=self.app, title="Save the download in…",
+                                         initialdir=start if Path(start).is_dir() else str(Path.home()))
+        if not folder:
+            return
+        self.app.config_data["download_dir"] = folder
+        self.app.save_config()
+        if kind == "asset":
+            url, accept, name = data["url"], "application/octet-stream", data["name"]
+        else:
+            url, accept, name = data["archive_download_url"], "application/vnd.github+json", data["name"] + ".zip"
+        dest = os.path.join(folder, name)
+        if os.path.exists(dest) and not messagebox.askyesno(APP_NAME, f"{name} already exists in that folder.\n"
+                                                             "Replace it?", parent=self.app):
+            return
+        last = [-1]
+
+        def set_info(text):
+            if self.tree.exists(iid):
+                self.tree.set(iid, "info", text)
+
+        def progress(done, total):
+            pct = done * 100 // total if total else done // (1024 * 1024)
+            if pct != last[0]:
+                last[0] = pct
+                text = f"⬇ {pct}%" if total else f"⬇ {human_size(done)}"
+                self.app.q.put(("call", lambda: set_info(text)))
+
+        def work():
+            try:
+                github_download(url, token, dest, accept, progress)
+                err = None
+            except Exception as e:
+                err = str(e)
+
+            def finished():
+                set_info("✖ failed" if err else "✔ downloaded")
+                if err:
+                    Toast(self.app, "Download failed", f"{name}\n{err}", "err")
+                else:
+                    Toast(self.app, "Download complete", f"{name}\nSaved in {folder}", "ok",
+                          action=("Open folder", lambda: open_path(folder)))
+            self.app.q.put(("call", finished))
+        set_info("⬇ starting…")
+        threading.Thread(target=work, daemon=True).start()
+
+
 # --------------------------------------------------------------------------- main window
 
 class App(tk.Tk):
@@ -926,6 +1240,13 @@ class App(tk.Tk):
         self.busy = False
         self.current = None
         self.forcing = False   # True only while a forced command's steps are being built
+        self.builds = {}       # project path -> GitHub Actions runs that are still running
+        self._seen_builds = set()
+        self._run_toasts = {}  # run id -> its "build running" notification
+        self._watch_running = False
+        self._watch_cycle = 0
+        self.dl_unseen = False
+        self.watch_var = tk.BooleanVar(value=self.config_data.get("watch_builds", True))
         self.force_var = tk.BooleanVar(value=False)
         self.check_on_launch_var = tk.BooleanVar(value=bool(self.config_data.get("check_on_launch")))
 
@@ -944,6 +1265,7 @@ class App(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.after(80, self._poll)
+        self.after(2500, self._watch_tick)
         if not shutil.which("git"):
             messagebox.showerror(APP_NAME, "Git was not found on your PATH.\nInstall it from https://git-scm.com and restart.")
         elif self.check_on_launch_var.get():
@@ -1005,6 +1327,9 @@ class App(tk.Tk):
         gm = tk.Menu(m, tearoff=False)
         gm.add_command(label="GitHub login…", command=self.login_dialog)
         gm.add_command(label="Test GitHub login", command=self.test_login)
+        gm.add_separator()
+        gm.add_checkbutton(label="Watch GitHub builds (notify when done)", variable=self.watch_var,
+                           command=self._toggle_watch)
         gm.add_separator()
         gm.add_command(label="Check all status", command=self.check_all_status)
         gm.add_checkbutton(label="Check all status at launch", variable=self.check_on_launch_var,
@@ -1068,11 +1393,17 @@ class App(tk.Tk):
         self.cmd_frame = ttk.LabelFrame(right, padding=8)
         self.cmd_frame.pack(fill="x")
 
-        oh = ttk.Frame(right)
-        oh.pack(fill="x", pady=(12, 4))
-        ttk.Label(oh, text="Output", style="Heading.TLabel").pack(side="left")
+        self.tabs = ttk.Notebook(right)
+        self.tabs.pack(fill="both", expand=True, pady=(12, 0))
+        out_tab = ttk.Frame(self.tabs, padding=(0, 6, 0, 0))
+        self.downloads = DownloadsPanel(self.tabs, self)
+        self.tabs.add(out_tab, text="Output")
+        self.tabs.add(self.downloads, text="Downloads")
+        self.tabs.bind("<<NotebookTabChanged>>", self._tab_changed)
+        oh = ttk.Frame(out_tab)
+        oh.pack(fill="x", pady=(0, 4))
         ttk.Button(oh, text="Clear", command=self.clear_console).pack(side="right")
-        cf = ttk.Frame(right)
+        cf = ttk.Frame(out_tab)
         cf.pack(fill="both", expand=True)
         self.console = tk.Text(cf, wrap="word", state="disabled", bg="#1e1f22", fg="#dcdcdc",
                                insertbackground="#dcdcdc", font=tkfont.nametofont("TkFixedFont"),
@@ -1091,7 +1422,8 @@ class App(tk.Tk):
         self.proj_list.delete(0, "end")
         for p in self.config_data["projects"]:
             missing = not Path(p["path"]).is_dir()
-            self.proj_list.insert("end", p["name"] + ("  ⚠" if missing else ""))
+            mark = "  ⚠" if missing else "  ⏳" if p["path"] in self.builds else ""
+            self.proj_list.insert("end", p["name"] + mark)
         if self.current in self.config_data["projects"]:
             i = self.config_data["projects"].index(self.current)
             self.proj_list.selection_clear(0, "end")
@@ -1113,6 +1445,131 @@ class App(tk.Tk):
             self.save_config()
         self.render_buttons()
         self.refresh_header()
+        self.dl_unseen = False
+        if self._downloads_visible():
+            self.downloads.load()
+        self._update_build_indicators()
+
+    # ---------- Downloads tab + GitHub build watcher
+    def _downloads_visible(self):
+        return self.tabs.select() == str(self.downloads)
+
+    def _tab_changed(self, _=None):
+        if self._downloads_visible():
+            self.dl_unseen = False
+            cur = self.current["path"] if self.current else None
+            if self.downloads.loaded_for != cur or not self.downloads.items:
+                self.downloads.load()
+            self._update_build_indicators()
+
+    def show_downloads(self, path):
+        p = next((x for x in self.config_data["projects"] if x["path"] == path), None)
+        if p and p is not self.current:
+            self.select_project(p)
+        self.tabs.select(self.downloads)
+        self.downloads.load()
+        self.deiconify()
+        self.lift()
+
+    def _update_build_indicators(self):
+        cur = self.current["path"] if self.current else None
+        running = self.builds.get(cur, [])
+        text = "Downloads" + (f"  ⏳ {len(running)} building" if running else "") + ("  ●" if self.dl_unseen else "")
+        self.tabs.tab(self.downloads, text=text)
+        self.downloads.set_builds(running)
+        self.refresh_project_list()
+
+    def _toggle_watch(self):
+        self.config_data["watch_builds"] = bool(self.watch_var.get())
+        self.save_config()
+        if not self.watch_var.get():
+            self.builds.clear()
+            self._update_build_indicators()
+
+    def _watch_tick(self):
+        """Every 20 s: check the current project and any project that is building; every 60 s: all projects."""
+        self.after(20000, self._watch_tick)
+        self._watch_cycle += 1
+        self.check_builds(full=self._watch_cycle % 3 == 1)
+
+    def check_builds(self, full=False, only=None):
+        if not self.watch_var.get() or self._watch_running:
+            return
+        cur = self.current["path"] if self.current else None
+        targets = [dict(p) for p in self.config_data["projects"]
+                   if (only is not None and p["path"] in only)
+                   or (only is None and (full or p["path"] == cur or p["path"] in self.builds))]
+        if not targets:
+            return
+        self._watch_running = True
+
+        def work():
+            results = []
+            try:
+                token = try_github_token()
+                for p in targets:
+                    # Without a login GitHub allows only 60 requests an hour, so just watch the current project.
+                    if not token and (p["path"] != cur or not full):
+                        continue
+                    if not Path(p["path"]).is_dir():
+                        continue
+                    gh = parse_github(origin_url(p["path"]))
+                    if not gh:
+                        continue
+                    try:
+                        data = github_api("GET", f"/repos/{gh[0]}/{gh[1]}/actions/runs?per_page=20", token, timeout=15)
+                        results.append((p, data.get("workflow_runs", [])))
+                    except RuntimeError:
+                        pass
+            finally:
+                def apply():
+                    self._watch_running = False
+                    for p, runs in results:
+                        self.apply_runs(p, runs)
+                self.q.put(("call", apply))
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply_runs(self, project, runs):
+        """Compare with what was running before and notify about builds that started or finished."""
+        path, name = project["path"], project["name"]
+        first_look = path not in self._seen_builds
+        self._seen_builds.add(path)
+        active = [r for r in runs if r.get("status") in ACTIVE_RUN_STATES]
+        before = {r["id"]: r for r in self.builds.get(path, [])}
+        now_ids = {r["id"] for r in active}
+        by_id = {r["id"]: r for r in runs}
+        for r in active:
+            if r["id"] not in before:
+                what = f"{r.get('name') or 'Workflow'} · {r.get('display_title') or r.get('head_branch', '')}"
+                self._run_toasts[r["id"]] = Toast(
+                    self, f"{'Build running' if first_look else 'Build started'} — {name}", what, "busy",
+                    action=("View", lambda u=r.get("html_url"): u and webbrowser.open(u)), timeout=30000)
+        finished_ok = False
+        for rid, old in before.items():
+            if rid in now_ids:
+                continue
+            if rid in self._run_toasts:  # replace its "running" notification
+                self._run_toasts.pop(rid).close()
+            r = by_id.get(rid, old)
+            what = f"{r.get('name') or 'Workflow'} · {r.get('display_title') or r.get('head_branch', '')}"
+            concl = r.get("conclusion")
+            if concl in ("failure", "cancelled", "timed_out", "startup_failure", "action_required"):
+                Toast(self, f"Build {concl.replace('_', ' ')} — {name}", what, "err",
+                      action=("View", lambda u=r.get("html_url"): u and webbrowser.open(u)))
+            else:
+                finished_ok = True
+                Toast(self, f"Build finished — {name}", f"{what}\nThe files are ready in Downloads.", "ok",
+                      action=("Show downloads", lambda p=path: self.show_downloads(p)))
+        if active:
+            self.builds[path] = active
+        else:
+            self.builds.pop(path, None)
+        if finished_ok and self.current and self.current["path"] == path:
+            if self._downloads_visible():
+                self.after(3000, self.downloads.load)  # give GitHub a moment to list the new files
+            else:
+                self.dl_unseen = True
+        self._update_build_indicators()
 
     def add_project(self, path, name=None):
         path = str(Path(path).expanduser().resolve())
@@ -1231,6 +1688,8 @@ class App(tk.Tk):
             self.refresh_header()
             if on_done:
                 on_done(ok)
+            if ok and p and key in ("tag", "release", "push"):  # a push may start a build — look soon
+                self.after(10000, lambda path=p["path"]: self.check_builds(only=[path]))
         self.run_steps(p, steps, finished)
 
     def run_steps(self, project, steps, on_done=None, stop_on_error=True):
@@ -1319,6 +1778,11 @@ class App(tk.Tk):
                 kind, payload = self.q.get_nowait()
                 if kind == "text":
                     self.console_write(*payload)
+                elif kind == "call":  # background threads hand UI updates to the main thread
+                    try:
+                        payload()
+                    except Exception as e:
+                        self.console_write(f"{e}\n", "err")
                 elif kind == "done":
                     ok, cb = payload
                     self.busy = False
