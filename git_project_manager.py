@@ -106,20 +106,21 @@ def get_github_token():
     raise RuntimeError("No GitHub token is stored yet. Open Git ▸ GitHub Login… and save a personal access token.")
 
 
-def github_api(method, path, token, payload=None):
+def github_api(method, path, token, payload=None, timeout=30):
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "git-project-manager",
+        "Content-Type": "application/json",
+    }
+    if token:  # public repos can be read without a token
+        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
         "https://api.github.com" + path, method=method,
-        data=json.dumps(payload).encode() if payload is not None else None,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-            "User-Agent": "git-project-manager",
-            "Content-Type": "application/json",
-        },
+        data=json.dumps(payload).encode() if payload is not None else None, headers=headers,
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read()
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as e:
@@ -316,14 +317,133 @@ def b_clone(app, p):
     return [S(["git", "clone", r["url"], str(dest)], cwd=str(Path(r["parent"]).expanduser()))], done
 
 
+# ---- version dropdown (Tag + Release dialogs)
+# Tags are grouped by their naming scheme, so "desktop-v1.4.0" and "android-v2.3.7" each get
+# their own "next version" suggestions. Pre-release endings (-beta.1, -rc2…) stay in the same group.
+VERSION_RE = re.compile(r"^(?P<pre>.*?)(?P<maj>\d+)\.(?P<min>\d+)(?:\.(?P<pat>\d+))?(?P<suf>.*)$")
+PRERELEASE_RE = re.compile(r"^(?P<grp>.*?)(?P<prer>[-.]?(?:alpha|beta|rc|pre|preview|dev)[.-]?\d*)$", re.I)
+
+
+def parse_version(tag):
+    m = VERSION_RE.match(tag)
+    if not m:
+        return None
+    pm = PRERELEASE_RE.match(m["suf"])
+    suffix, prer = (pm["grp"], pm["prer"]) if pm else (m["suf"], "")
+    nums = (int(m["maj"]), int(m["min"]), int(m["pat"]) if m["pat"] is not None else None)
+    return {"prefix": m["pre"], "suffix": suffix, "prer": prer, "nums": nums,
+            "group": f"{m['pre']}…{suffix}", "key": (nums[0], nums[1], nums[2] or 0, 0 if prer else 1)}
+
+
+def next_versions(v):
+    """Suggested next tags after version v, keeping its naming style."""
+    def fmt(*nums):
+        return v["prefix"] + ".".join(str(n) for n in nums if n is not None) + v["suffix"]
+    maj, mi, pa = v["nums"]
+    out = [(fmt(maj, mi, pa), "final release")] if v["prer"] else []
+    if pa is not None:
+        out.append((fmt(maj, mi, pa + 1), "next patch"))
+        out += [(fmt(maj, mi + 1, 0), "next minor"), (fmt(maj + 1, 0, 0), "next major")]
+    else:
+        out += [(fmt(maj, mi + 1), "next minor"), (fmt(maj + 1, 0), "next major")]
+    return out
+
+
+def first_word(text):
+    """Dropdown entries are 'tag    description'; tags never contain spaces."""
+    parts = (text or "").split()
+    return parts[0] if parts else ""
+
+
+def version_choices(app, path, for_release=False):
+    """Existing tags and GitHub releases plus suggested next versions per group.
+    Returns (dropdown values, default tag, releases by tag, note about what couldn't be loaded)."""
+    app.config(cursor="watch")
+    app.update_idletasks()
+    try:
+        tags = {}  # newest first
+        code, out = git_out(["for-each-ref", "--sort=-creatordate",
+                             "--format=%(refname:short)\t%(creatordate:short)", "refs/tags"], path)
+        if code == 0:
+            for line in out.splitlines():
+                name, _, date = line.partition("\t")
+                if name:
+                    tags[name] = date
+        releases, note = {}, ""
+        gh = parse_github(origin_url(path))
+        if gh:
+            try:
+                try:
+                    token = get_github_token()
+                except RuntimeError:
+                    token = None
+                for page in range(1, 6):
+                    batch = github_api("GET", f"/repos/{gh[0]}/{gh[1]}/releases?per_page=100&page={page}",
+                                       token, timeout=10)
+                    for rel in batch:
+                        releases.setdefault(rel["tag_name"], rel)
+                    if len(batch) < 100:
+                        break
+            except RuntimeError as e:
+                note = f"Couldn't load releases from GitHub ({e}) — showing local tags only."
+        else:
+            note = "No GitHub remote — showing local tags only."
+    finally:
+        app.config(cursor="")
+
+    def rel_date(name):
+        rel = releases.get(name)
+        return ((rel.get("published_at") or rel.get("created_at") or "")[:10]) if rel else tags.get(name, "")
+
+    def describe(name):
+        rel = releases.get(name)
+        if not rel:
+            return f"tag only, no release  {tags.get(name, '')}".rstrip()
+        kind = "draft release" if rel.get("draft") else "pre-release" if rel.get("prerelease") else "released"
+        return f"{kind}  {rel_date(name)}".rstrip()
+
+    names = set(tags) | set(releases)
+    groups, other = {}, []
+    for name in names:
+        v = parse_version(name)
+        if v:
+            groups.setdefault(v["group"], []).append((v, name))
+        else:
+            other.append(name)
+
+    def row(tag, text):
+        return f"{tag}      {text}"
+
+    values, default = [], ""
+    if for_release:
+        newest = next(iter(tags), None)
+        if newest and newest not in releases:
+            default = newest  # you just made a tag with the Tag button — release that one
+    # groups with the most recent activity first
+    for gname, items in sorted(groups.items(), key=lambda kv: max(rel_date(n) for _, n in kv[1]), reverse=True):
+        items.sort(key=lambda x: x[0]["key"], reverse=True)
+        latest_v, latest_name = items[0]
+        for tag, why in next_versions(latest_v):
+            if tag not in names:
+                values.append(row(tag, f"→ {why} for {gname}  (latest: {latest_name})"))
+                default = default or tag
+        values += [row(n, describe(n)) for _, n in items[:5]]
+    values += [row(n, describe(n)) for n in sorted(other)[:10]]
+    return values, default, releases, note
+
+
 def b_tag(app, p):
+    values, _, _, note = version_choices(app, p["path"])
     r = app.ask(forced(app, "git tag"), [
-        F("name", "Tag name", hint="e.g. v1.2.0 — leave blank to list existing tags."),
+        F("name", "Tag name", kind="combo", values=values, first_word=True, width=64,
+          hint="Open the list for the next version of each group, or type your own (e.g. v1.2.0).\n"
+               "Leave blank to list existing tags." + (f"\n{note}" if note else "")),
         F("message", "Message", hint="Optional annotation (defaults to the tag name)."),
         F("push", "Push the tag to GitHub", True, "check"),
     ])
     if not r:
         return None
+    r["name"] = first_word(r["name"])
     if not r["name"]:
         return [S(["git", "tag", "-n", "--sort=-creatordate"])]
     f = ["-f"] if app.forcing else []
@@ -339,20 +459,26 @@ def b_release(app, p):
         messagebox.showerror(APP_NAME, "This project has no GitHub remote named 'origin'.\n"
                              "Use 'Remote add origin' first.", parent=app)
         return None
-    code, latest = git_out(["describe", "--tags", "--abbrev=0"], p["path"])
+    values, default, releases, note = version_choices(app, p["path"], for_release=True)
     r = app.ask("Create GitHub release", [
-        F("tag", "Tag", latest if code == 0 and latest else "v1.0.0",
-          hint="An existing tag is pushed first; a new tag is created on GitHub from the current branch."),
+        F("tag", "Tag", default or "v1.0.0", "combo", values=values, first_word=True, width=64,
+          hint="Open the list to see existing releases and the next version of each group, or type your own.\n"
+               "An existing tag is pushed first; a new tag is created on GitHub from the current branch."
+               + (f"\n{note}" if note else "")),
         F("title", "Title", hint="Defaults to the tag."),
         F("notes", "Release notes", kind="text"),
         F("generate", "Auto-generate notes from commits", True, "check"),
         F("draft", "Save as draft", False, "check"),
         F("prerelease", "Mark as pre-release", False, "check"),
     ])
-    if not r or not r["tag"]:
+    tag = first_word(r["tag"]) if r else ""
+    if not tag:
+        return None
+    if tag in releases:
+        if messagebox.askyesno(APP_NAME, f"A release for {tag} already exists.\n\nOpen it on GitHub?", parent=app):
+            webbrowser.open(releases[tag].get("html_url") or f"https://github.com/{gh[0]}/{gh[1]}/releases")
         return None
     owner, repo = gh
-    tag = r["tag"]
     tag_exists = git_out(["rev-parse", "-q", "--verify", f"refs/tags/{tag}"], p["path"])[0] == 0
     payload = {"tag_name": tag, "name": r["title"] or tag, "body": r["notes"], "draft": r["draft"],
                "prerelease": r["prerelease"], "generate_release_notes": r["generate"]}
@@ -537,7 +663,10 @@ class FormDialog(tk.Toplevel):
                 else:
                     v = tk.StringVar(value=f["default"])
                     if kind == "combo":
-                        w = ttk.Combobox(body, textvariable=v, values=f.get("values", []), width=50)
+                        w = ttk.Combobox(body, textvariable=v, values=f.get("values", []),
+                                         width=f.get("width", 50), height=20)
+                        if f.get("first_word"):  # picking "v1.2.3   next patch…" leaves just "v1.2.3"
+                            w.bind("<<ComboboxSelected>>", lambda e, v=v: v.set(first_word(v.get())))
                     else:
                         w = ttk.Entry(body, textvariable=v, width=52, show="•" if kind == "password" else "")
                     w.grid(row=row, column=1, columnspan=1 if kind == "folder" else 2, sticky="ew", pady=4)

@@ -60,5 +60,6 @@ Output goes to `dist/`. The `build/` and `dist/` folders are generated, so add t
 ## Notes
 
 - **Release** creates a GitHub release through the GitHub API, and pushes the tag first if it exists locally.
+- The tag box in **Tag** and **Release** is a dropdown of existing tags and releases, grouped by naming scheme (e.g. `desktop-v…`, `android-v…`), with the next patch, minor and major version suggested for each group. You can still type any tag.
 - Commands that need an editor or typed input (e.g. `git rebase -i`) aren't supported, because nothing can wait on a prompt in the background.
 - Settings and the log are stored in `~/.git_project_manager/`. Your token is never written to the log.
