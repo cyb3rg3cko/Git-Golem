@@ -802,7 +802,7 @@ class SettingsDialog(tk.Toplevel):
         self.items = [list(x) for x in normalize_buttons(project["buttons"])]
         self.title(f"Settings — {project['name']}")
         self.transient(app)
-        self.geometry("520x560")
+        self.geometry("540x620")
         self.minsize(460, 460)
 
         outer = ttk.Frame(self, padding=14)
@@ -825,6 +825,17 @@ class SettingsDialog(tk.Toplevel):
                           ("▼ Move down", lambda: self.move(1)), ("Show all", self.show_all),
                           ("Reset to default", self.reset)]:
             ttk.Button(side, text=text, command=cmd, width=16).pack(fill="x", pady=2)
+
+        shared = app.config_data.get("default_buttons")
+        # Ticked when this project's order is the one shared with all projects.
+        self.was_shared = bool(shared) and [k for k, _ in normalize_buttons(shared)] == [k for k, _ in self.items]
+        self.share_var = tk.BooleanVar(value=self.was_shared)
+        ttk.Checkbutton(outer, text="Use this button order for all projects, including new ones",
+                        variable=self.share_var).grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Label(outer, foreground="gray", wraplength=470, justify="left",
+                  text="Other projects keep their own show/hide choices and only change order. "
+                       "New projects copy this project's buttons exactly.").grid(
+            row=5, column=0, columnspan=3, sticky="w", padx=(22, 0))
 
         outer.columnconfigure(1, weight=1)
         outer.rowconfigure(3, weight=1)
@@ -874,6 +885,20 @@ class SettingsDialog(tk.Toplevel):
         self.refresh()
 
     def save(self):
+        if self.share_var.get():
+            order = [k for k, _ in self.items]
+            others = [p for p in self.app.config_data["projects"]
+                      if p is not self.project and [k for k, _ in p["buttons"]] != order]
+            if others and not messagebox.askyesno(
+                    APP_NAME, f"Change the button order in {len(others)} other project"
+                              f"{'s' if len(others) != 1 else ''} to match this one?", parent=self):
+                return
+            for p in others:
+                visible = dict(p["buttons"])
+                p["buttons"] = [[k, visible.get(k, k in DEFAULT_VISIBLE)] for k in order]
+            self.app.config_data["default_buttons"] = [list(x) for x in self.items]
+        elif self.was_shared:  # unticked: new projects go back to the standard layout
+            self.app.config_data.pop("default_buttons", None)
         self.project["buttons"] = self.items
         self.project["name"] = self.name_var.get().strip() or self.project["name"]
         self.app.save_config()
@@ -1577,7 +1602,8 @@ class App(tk.Tk):
             if os.path.normcase(p["path"]) == os.path.normcase(path):
                 self.select_project(p)
                 return p
-        p = {"name": name or Path(path).name, "path": path, "buttons": normalize_buttons(None)}
+        p = {"name": name or Path(path).name, "path": path,
+             "buttons": normalize_buttons(self.config_data.get("default_buttons"))}
         self.config_data["projects"].append(p)
         self.config_data["projects"].sort(key=lambda x: x["name"].lower())
         self.save_config()

@@ -33,7 +33,7 @@ The token is stored in Git's credential helper. On Windows that's Credential Man
 | Force mode | Tick **⚠ Force** above the buttons. Forceable commands (Add, Push, Pull, Branch, Switch branch, Tag) get a ⚠ and everything else is greyed out. Clicking one shows a warning popup first, and Force switches itself off after one use |
 | Downloads | The **Downloads** tab next to Output lists each release's files and the build artifacts from GitHub Actions. Select a file and click **⬇ Download** (or double-click it) |
 | Build notifications | While a GitHub Actions build runs, the project gets a ⏳ in the list, the Downloads tab shows a "building" banner, and a pop-up appears when it starts and when it finishes or fails. Turn it off with **Git ▸ Watch GitHub builds** |
-| Per-project settings | **⚙ Settings** to show/hide buttons, reorder them, rename or remove the project |
+| Per-project settings | **⚙ Settings** to show/hide buttons, reorder them, rename or remove the project. Tick **Use this button order for all projects** to give every project, and new ones, the same order |
 | Command log | **⚙ Settings ▸ View command log** (this project), or **Git ▸ Command log…** (all projects) |
 
 Commands run in the background, and their output streams into the Output pane, with the project name in front of each command (`website $ git push`). A multi-step action stops at the first failing step.
